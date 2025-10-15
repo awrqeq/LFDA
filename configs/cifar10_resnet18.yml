@@ -1,0 +1,61 @@
+# General Configuration
+device: "cuda"  # "cuda" or "cpu"
+seed: 42
+num_workers: 4
+
+# Data Configuration
+dataset:
+  name: "cifar10"
+  path: "./datasets/cifar10"
+  img_size: 32
+  num_classes: 10
+
+# Model Configuration
+surrogate_model:
+  name: "resnet18"
+  pretrained_path: "./pretrained/resnet18_cifar10.pth" # Path to clean pretrained surrogate model
+victim_model:
+  name: "resnet18"
+
+# LFDA-U Trigger Generator Training Configuration
+generator_training:
+  epochs: 50
+  batch_size: 128
+  lr: 0.001
+  target_class: 0  # e.g., class 'airplane' in CIFAR-10
+
+  # Loss weights
+  lambda_latent: 1.0
+  lambda_stealth_mse: 10.0
+  lambda_stealth_lpips: 5.0
+  lambda_smooth: 0.001
+
+  # Checkpoint saving
+  save_dir: "./checkpoints/generator"
+  save_name: "generator_cifar10.pth"
+
+# Victim Model Training (Backdoor Injection) Configuration
+victim_training:
+  generator_path: "./checkpoints/generator/generator_cifar10.pth" # Path to the trained generator
+  epochs: 100
+  batch_size: 128
+  lr: 0.1
+  momentum: 0.9
+  weight_decay: 0.0005
+
+  attack_type: "clean_label" # "clean_label" or "all_to_one"
+  poison_rate: 0.1 # 10% poisoning rate
+  target_class: 0
+
+  # Periodic evaluation
+  eval_every_epochs: 5
+
+  # Checkpoint saving
+  save_dir: "./checkpoints/victim_model"
+  save_name: "victim_resnet18_cifar10.pth"
+
+# Evaluation Configuration
+evaluation:
+  victim_model_path: "./checkpoints/victim_model/victim_resnet18_cifar10.pth"
+  generator_path: "./checkpoints/generator/generator_cifar10.pth"
+  batch_size: 256
