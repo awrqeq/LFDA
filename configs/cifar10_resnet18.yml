@@ -1,5 +1,7 @@
 # General Configuration
-device: "cuda"  # "cuda" or "cpu"
+# REMOVED: device: "cuda"
+# ADDED: device_ids list to control GPU usage
+device_ids: [0, 1]  # Use GPUs 0 and 1. For single GPU, use [0] or [1].
 seed: 42
 num_workers: 4
 
@@ -13,49 +15,45 @@ dataset:
 # Model Configuration
 surrogate_model:
   name: "resnet18"
-  pretrained_path: "./pretrained/resnet18_cifar10.pth" # Path to clean pretrained surrogate model
+  pretrained_path: "./pretrained/resnet18_cifar10.pth"
 victim_model:
   name: "resnet18"
 
-# LFDA-U Trigger Generator Training Configuration
+# LFDA-U Trigger Generator Training Configuration (using the high-ASR config)
 generator_training:
-  epochs: 50
+  epochs: 100
   batch_size: 128
   lr: 0.001
-  target_class: 0  # e.g., class 'airplane' in CIFAR-10
+  target_class: 0
 
-  # Loss weights
   lambda_latent: 1.0
   lambda_stealth_mse: 10.0
   lambda_stealth_lpips: 5.0
   lambda_smooth: 0.001
 
-  # Checkpoint saving
   save_dir: "./checkpoints/generator"
-  save_name: "generator_cifar10.pth"
+  save_name: "generator_cifar10_v4.pth"
 
-# Victim Model Training (Backdoor Injection) Configuration
+# Victim Model Training Configuration
 victim_training:
-  generator_path: "./checkpoints/generator/generator_cifar10.pth" # Path to the trained generator
+  generator_path: "./checkpoints/generator/generator_cifar10_v4.pth"
   epochs: 100
   batch_size: 128
   lr: 0.1
   momentum: 0.9
   weight_decay: 0.0005
 
-  attack_type: "clean_label" # "clean_label" or "all_to_one"
-  poison_rate: 0.1 # 10% poisoning rate
+  attack_type: "clean_label"
+  poison_rate: 0.1
   target_class: 0
 
-  # Periodic evaluation
   eval_every_epochs: 5
 
-  # Checkpoint saving
   save_dir: "./checkpoints/victim_model"
   save_name: "victim_resnet18_cifar10.pth"
 
 # Evaluation Configuration
 evaluation:
   victim_model_path: "./checkpoints/victim_model/victim_resnet18_cifar10.pth"
-  generator_path: "./checkpoints/generator/generator_cifar10.pth"
+  generator_path: "./checkpoints/generator/generator_cifar10_v4.pth"
   batch_size: 256
