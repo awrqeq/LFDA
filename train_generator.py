@@ -77,6 +77,14 @@ def main(config_path, resume_from=None):
                                                                      nn.DataParallel) else generator.parameters()
     optimizer = optim.Adam(params_to_optimize, lr=config['generator_training']['lr'])
 
+    #
+    # ####################################################################
+    # ### 核心修改 1: 增加余弦退火学习率调度器                       ###
+    # ####################################################################
+    #
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['generator_training']['epochs'])
+    # ####################################################################
+
     print("--- Starting NFF TriggerNet Training ---")
     for epoch in range(config['generator_training']['epochs']):
         model_to_train = generator.module if isinstance(generator, nn.DataParallel) else generator
@@ -101,6 +109,14 @@ def main(config_path, resume_from=None):
 
             total_loss += loss.item()
             progress_bar.set_postfix({'Loss': f'{total_loss / (progress_bar.n + 1):.4f}'})
+
+        #
+        # ####################################################################
+        # ### 核心修改 2: 在每个epoch结束后更新学习率                    ###
+        # ####################################################################
+        #
+        scheduler.step()
+        # ####################################################################
 
     save_dir = config['generator_training']['save_dir']
     os.makedirs(save_dir, exist_ok=True)

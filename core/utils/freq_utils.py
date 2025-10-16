@@ -1,85 +1,112 @@
-#
-# 请用以下全部代码覆盖您的 core/utils/freq_utils.py 文件
-#
 import torch
+from pytorch_wavelets import DWTForward, DWTInverse
+from torch_dct import dct_2d, idct_2d
 
 
+# --- 原有的 FFT 函数保持不变 ---
 def to_freq(x: torch.Tensor) -> torch.Tensor:
-    """Converts a batch of spatial domain images to the frequency domain (complex tensor)."""
-    # We apply fftshift to move the zero-frequency component to the center
-    return torch.fft.fftshift(torch.fft.fft2(x, dim=(-2, -1)), dim=(-2, -1))
+    return torch.fft.fft2(x, norm="ortho")
 
 
-def to_spatial(x_freq_shifted: torch.Tensor) -> torch.Tensor:
-    """Converts a batch of shifted frequency representations back to the spatial domain."""
-    # First, apply ifftshift to move the zero-frequency component back to the corner
-    x_freq = torch.fft.ifftshift(x_freq_shifted, dim=(-2, -1))
-    return torch.fft.ifft2(x_freq, dim=(-2, -1)).real
+def to_spatial(x: torch.Tensor) -> torch.Tensor:
+    return torch.fft.ifft2(x, norm="ortho").real
 
 
-# ####################################################################
-# ### 核心修改 1: 重写 extract_freq_patch 以正确处理多通道       ###
-# ####################################################################
-def extract_freq_patch_and_reshape(x_freq: torch.Tensor, patch_size: int, start_row: int,
-                                   start_col: int) -> torch.Tensor:
+def extract_freq_patch_and_reshape(x_freq, patch_size, start_row, start_col):
+    patch_freq = x_freq[:, :, start_row: start_row + patch_size, start_col: start_col + patch_size]
+    return patch_freq.reshape(patch_freq.size(0), -1)
+
+
+def reshape_and_insert_freq_patch(x_freq, delta_patch_reshaped, strength, patch_size, start_row, start_col):
+    delta_patch = delta_patch_reshaped.reshape(
+        delta_patch_reshaped.size(0), 3, patch_size, patch_size
+    )
+    x_freq[:, :, start_row: start_row + patch_size, start_col: start_col + patch_size] += (
+            strength * delta_patch
+    )
+    return x_freq
+
+
+# --- 全新的、修正后的 DWT/IDWT 函数 ---
+
+def get_dwt_idwt(device):
+    """获取DWT和IDWT变换器"""
+    # J=1 代表进行一级小波分解
+    dwt = DWTForward(J=1, wave='haar', mode='zero').to(device)
+    idwt = DWTInverse(wave='haar', mode='zero').to(device)
+    return dwt, idwt
+
+
+def to_dwt(x: torch.Tensor, dwt: DWTForward) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """
-    Extracts a frequency patch from each channel and reshapes for batch processing.
-    Input shape: [B, C, H, W] (complex)
-    Output shape: [B * C, 2, patch_size, patch_size] (real)
+    执行DWT变换，并正确解包。
+    返回:
+        ll (torch.Tensor): 低频子带。
+        high_freqs (list[torch.Tensor]): 一个包含 [lh, hl, hh] 三个独立张量的列表。
     """
-    B, C, H, W = x_freq.shape
-
-    # Extract the patch from the complex frequency representation
-    patch_complex = x_freq[:, :, start_row: start_row + patch_size, start_col: start_col + patch_size]
-
-    # Separate real and imaginary parts
-    patch_real = patch_complex.real  # Shape: [B, C, patch_size, patch_size]
-    patch_imag = patch_complex.imag  # Shape: [B, C, patch_size, patch_size]
-
-    # Stack them to create a new dimension: [B, C, 2, patch_size, patch_size]
-    # where dim=2 corresponds to [real, imag]
-    stacked_patch = torch.stack([patch_real, patch_imag], dim=2)
-
-    # Reshape to merge batch and channel dimensions for the TriggerNet
-    # [B, C, 2, patch_size, patch_size] -> [B * C, 2, patch_size, patch_size]
-    reshaped_patch = stacked_patch.view(-1, 2, patch_size, patch_size)
-
-    return reshaped_patch
+    ll, yh = dwt(x)
+    # yh 是一个列表，对于 J=1，它只包含一个张量 yh[0]
+    # yh[0] 的形状是 (N, C, 3, H, W)，其中第3个维度堆叠了 lh, hl, hh
+    # 我们需要将它们解包成三个独立的张量
+    lh = yh[0][:, :, 0, :, :]
+    hl = yh[0][:, :, 1, :, :]
+    hh = yh[0][:, :, 2, :, :]
+    return ll, [lh, hl, hh]
 
 
-# ####################################################################
-
-
-# ####################################################################
-# ### 核心修改 2: 重写 insert_freq_patch 以正确处理多通道        ###
-# ####################################################################
-def reshape_and_insert_freq_patch(x_freq: torch.Tensor, delta_patch_reshaped: torch.Tensor,
-                                  patch_size: int, start_row: int, start_col: int,
-                                  strength: float) -> torch.Tensor:
+def to_idwt(ll: torch.Tensor, high_freqs: list[torch.Tensor], idwt: DWTInverse) -> torch.Tensor:
     """
-    Reshapes the perturbation patch from the TriggerNet and inserts it back.
-    delta_patch_reshaped shape: [B * C, 2, patch_size, patch_size]
-    x_freq shape: [B, C, H, W] (complex)
+    执行IDWT变换，并正确打包。
+    参数:
+        ll (torch.Tensor): 低频子带。
+        high_freqs (list[torch.Tensor]): 一个包含 [lh, hl, hh] 三个独立张量的列表。
     """
-    B, C, H, W = x_freq.shape
+    # 我们需要将 [lh, hl, hh] 重新堆叠成 idwt 所期望的格式
+    # 期望格式: 一个列表，其中包含一个 (N, C, 3, H, W) 形状的张量
+    yh_tensor = torch.stack(high_freqs, dim=2)
+    return idwt((ll, [yh_tensor]))
 
-    # Reshape the output of TriggerNet back
-    # [B * C, 2, patch_size, patch_size] -> [B, C, 2, patch_size, patch_size]
-    delta_patch_stacked = delta_patch_reshaped.view(B, C, 2, patch_size, patch_size)
 
-    # Separate real and imaginary perturbation parts
-    delta_real = delta_patch_stacked[:, :, 0, :, :]  # Shape: [B, C, patch_size, patch_size]
-    delta_imag = delta_patch_stacked[:, :, 1, :, :]  # Shape: [B, C, patch_size, patch_size]
+def double_dct_smooth(x_preliminary: torch.Tensor, x_source: torch.Tensor, alpha=0.5) -> torch.Tensor:
+    """
+    使用两次DCT变换进行深度平滑融合。
+    """
+    # 使用 .float() 确保输入是浮点数，避免 torch_dct 的潜在类型错误
+    dct_pre = dct_2d(dct_2d(x_preliminary.float(), norm='ortho'), norm='ortho')
+    dct_src = dct_2d(dct_2d(x_source.float(), norm='ortho'), norm='ortho')
 
-    # Combine into a complex tensor
-    delta_complex = torch.complex(delta_real, delta_imag)  # Shape: [B, C, patch_size, patch_size]
+    fused_dct = alpha * dct_pre + (1 - alpha) * dct_src
 
-    # Create a full-sized zero tensor for the delta
-    full_delta = torch.zeros_like(x_freq)
+    smoothed_img = idct_2d(idct_2d(fused_dct, norm='ortho'), norm='ortho')
+    return smoothed_img
 
-    # Place the complex delta into the correct location
-    full_delta[:, :, start_row: start_row + patch_size, start_col: start_col + patch_size] = delta_complex
 
-    # Add the scaled perturbation to the original frequency representation
-    return x_freq + strength * full_delta
-# ####################################################################
+def get_image_complexity(x: torch.Tensor) -> torch.Tensor:
+    """
+    计算图像的复杂度作为动态强度的依据。
+    """
+    # 确保权重张量与输入张量在同一设备上
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=x.device).view(1, 1, 3,
+                                                                                                            3).repeat(
+        x.size(1), 1, 1, 1)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=x.device).view(1, 1, 3,
+                                                                                                            3).repeat(
+        x.size(1), 1, 1, 1)
+
+    # 确保输入是浮点数
+    x_float = x.float()
+    grad_x = torch.nn.functional.conv2d(x_float, sobel_x, padding=1, groups=x.size(1))
+    grad_y = torch.nn.functional.conv2d(x_float, sobel_y, padding=1, groups=x.size(1))
+
+    grad_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    complexity = grad_magnitude.mean(dim=[1, 2, 3], keepdim=True)
+
+    min_val, max_val = torch.min(complexity), torch.max(complexity)
+    if (max_val - min_val) > 1e-6:  # 避免除以零
+        complexity = (complexity - min_val) / (max_val - min_val)
+
+    # 映射到 [0.5, 1.5] 范围
+    strength_factor = 0.5 + complexity
+
+    return strength_factor

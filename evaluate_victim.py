@@ -1,13 +1,11 @@
-#
-# 请用以下全部代码覆盖您的 evaluate_victim.py 文件
-#
 import yaml
 import torch
 import torch.nn as nn
-import os
 from tqdm import tqdm
+import os
+import argparse
 
-# --- 环境设置：确保 torch.hub 下载到项目内部 ---
+# --- 环境设置 ---
 project_dir = os.path.dirname(os.path.abspath(__file__))
 torch_hub_dir = os.path.join(project_dir, 'pretrained', 'torch_hub')
 os.makedirs(torch_hub_dir, exist_ok=True)
@@ -15,105 +13,114 @@ torch.hub.set_dir(torch_hub_dir)
 # --- 环境设置结束 ---
 
 from core.models.resnet import ResNet18
-from core.models.generator import TriggerNet
+from core.models.generator import MultiScaleAttentionGenerator
 from data.cifar10 import get_dataloader
-from core.utils import freq_utils
+from core.attack import BackdoorAttack
+
+
+def evaluate_advanced(classifier, generator, attack_helper, test_loader, device):
+    """
+    评估后门模型的性能（高级版本）。
+
+    Args:
+        classifier (nn.Module): 待评估的分类器模型。
+        generator (nn.Module): 触发器生成器。
+        attack_helper (BackdoorAttack): 攻击助手实例，用于调用其方法和参数。
+        test_loader (DataLoader): 测试数据集的加载器。
+        device (torch.device): 运行设备 (CPU or GPU)。
+
+    Returns:
+        tuple[float, float]: (良性准确率 BA, 攻击成功率 ASR)，均为百分比。
+    """
+    classifier.eval()
+    generator.eval()
+
+    total_samples = 0
+    clean_correct = 0
+    poisoned_correct_as_target = 0
+    poisoned_total = 0
+
+    progress_bar = tqdm(test_loader, desc="Evaluating")
+
+    with torch.no_grad():
+        for x_clean, y_true in progress_bar:
+            x_clean, y_true = x_clean.to(device), y_true.to(device)
+
+            # --- 评估良性准确率 (BA) ---
+            outputs_clean = classifier(x_clean)
+            _, predicted_clean = torch.max(outputs_clean, 1)
+            total_samples += y_true.size(0)
+            clean_correct += (predicted_clean == y_true).sum().item()
+
+            # --- 评估攻击成功率 (ASR) ---
+            # 只对非目标类别的样本进行攻击测试
+            non_target_mask = (y_true != attack_helper.target_class)
+            if non_target_mask.any():
+                x_to_poison = x_clean[non_target_mask]
+
+                # 使用 is_train=False 来激活在评估时使用的“强触发”
+                x_poisoned = attack_helper.generate_poisoned_sample(x_to_poison, is_train=False)
+
+                outputs_poisoned = classifier(x_poisoned)
+                _, predicted_poisoned = torch.max(outputs_poisoned, 1)
+
+                poisoned_total += x_to_poison.size(0)
+                poisoned_correct_as_target += (predicted_poisoned == attack_helper.target_class).sum().item()
+
+            ba_running = 100 * clean_correct / total_samples if total_samples > 0 else 0
+            asr_running = 100 * poisoned_correct_as_target / poisoned_total if poisoned_total > 0 else 0
+            progress_bar.set_postfix({
+                'BA': f'{ba_running:.2f}%',
+                'ASR': f'{asr_running:.2f}%'
+            })
+
+    ba = 100 * clean_correct / total_samples
+    asr = 100 * poisoned_correct_as_target / poisoned_total if poisoned_total > 0 else 0
+
+    return ba, asr
 
 
 def main(config_path):
+    """
+    主函数，用于独立运行评估脚本。
+    """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    # --- 设备设置，支持多GPU ---
-    if torch.cuda.is_available() and config.get('device_ids'):
-        device_ids = config['device_ids']
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, device_ids))
-        if len(device_ids) > 0:
-            device = torch.device("cuda:0")
-            print(f"Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
-        else:
-            device_ids = []
-            device = torch.device("cpu")
-            print("No GPUs specified, using CPU.")
-    else:
-        device_ids = []
-        device = torch.device("cpu")
-        print("CUDA not available or no GPUs specified, using CPU.")
-    # --- 设备设置结束 ---
+    # --- 设备设置 ---
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(config['seed'])
+    eval_config = config['evaluation']
 
-    test_loader = get_dataloader(config['evaluation']['batch_size'], False, config['dataset']['path'],
-                                 config['num_workers'])
+    # --- 数据加载器 ---
+    test_loader = get_dataloader(eval_config['batch_size'], False, config['dataset']['path'], config['num_workers'])
 
     # --- 模型加载 ---
-    victim_model = ResNet18(num_classes=config['dataset']['num_classes'])
-    victim_model.load_state_dict(torch.load(config['evaluation']['victim_model_path'], map_location='cpu'))
-    victim_model = victim_model.to(device)
+    # 分类器
+    victim_classifier = ResNet18(num_classes=config['dataset']['num_classes']).to(device)
+    victim_classifier.load_state_dict(torch.load(eval_config['victim_model_path'], map_location=device))
+    print(f"Loaded victim model from: {eval_config['victim_model_path']}")
 
-    generator = TriggerNet()
-    generator.load_state_dict(torch.load(config['evaluation']['generator_path'], map_location='cpu'))
-    generator = generator.to(device)
+    # 生成器
+    generator = MultiScaleAttentionGenerator().to(device)
+    generator.load_state_dict(torch.load(eval_config['generator_path'], map_location=device))
+    print(f"Loaded generator from: {eval_config['generator_path']}")
 
-    if len(device_ids) > 1:
-        victim_model = nn.DataParallel(victim_model)
-        generator = nn.DataParallel(generator)
+    # 创建一个临时的 attack_helper 实例以传递给评估函数
+    attack_helper = BackdoorAttack(generator, victim_classifier, config, device)
 
-    victim_model.eval()
-    generator.eval()
+    # --- 执行评估 ---
+    ba, asr = evaluate_advanced(victim_classifier, generator, attack_helper, test_loader, device)
 
-    print("--- Starting Final Evaluation ---")
-
-    # --- 获取NFF参数 ---
-    trigger_net_config = config['generator_training']['trigger_net']
-    injection_strength = config['generator_training']['injection_strength']
-    target_class = config['victim_training']['target_class']
-
-    total_correct_clean, total_correct_poisoned, total_poisoned_samples, total_samples = 0, 0, 0, 0
-
-    with torch.no_grad():
-        print("Evaluating Benign Accuracy (BA)...")
-        for x, y in tqdm(test_loader, desc="BA"):
-            x, y = x.to(device), y.to(device)
-            outputs = victim_model(x)
-            _, predicted = torch.max(outputs.data, 1)
-            total_samples += y.size(0)
-            total_correct_clean += (predicted == y).sum().item()
-        ba = 100 * total_correct_clean / total_samples if total_samples > 0 else 0
-
-        print("Evaluating Attack Success Rate (ASR)...")
-        for x, y in tqdm(test_loader, desc="ASR"):
-            x, y = x.to(device), y.to(device)
-            non_target_mask = (y != target_class)
-            if not non_target_mask.any():
-                continue
-
-            x_to_poison = x[non_target_mask]
-
-            # --- 使用NFF逻辑生成毒化样本 ---
-            x_freq = freq_utils.to_freq(x_to_poison)
-            freq_patch = freq_utils.extract_freq_patch_and_reshape(x_freq, **trigger_net_config)
-            delta_patch = generator(freq_patch)
-            poisoned_freq = freq_utils.reshape_and_insert_freq_patch(x_freq, delta_patch, strength=injection_strength,
-                                                                     **trigger_net_config)
-            x_p = freq_utils.to_spatial(poisoned_freq)
-            x_p = torch.clamp(x_p, 0, 1)
-
-            outputs = victim_model(x_p)
-            _, predicted = torch.max(outputs.data, 1)
-
-            total_poisoned_samples += x_to_poison.size(0)
-            total_correct_poisoned += (predicted == target_class).sum().item()
-
-    asr = 100 * total_correct_poisoned / total_poisoned_samples if total_poisoned_samples > 0 else 0
-
-    print("\n--- Evaluation Results ---")
+    print("\n--- Final Evaluation Results ---")
     print(f"Benign Accuracy (BA): {ba:.2f}%")
     print(f"Attack Success Rate (ASR): {asr:.2f}%")
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/cifar10_resnet18.yml', help='Path to the config file')
+    parser = argparse.ArgumentParser(description="Evaluate a backdoored victim model.")
+    # 让配置文件路径更灵活
+    parser.add_argument('--config', type=str, default='configs/cifar10_advanced_joint.yml',
+                        help='Path to the config file.')
     args = parser.parse_args()
     main(args.config)

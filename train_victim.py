@@ -135,24 +135,39 @@ def main(config_path):
         for x, y in progress_bar:
             x, y = x.to(device), y.to(device)
 
-            num_to_poison = int(poison_rate * x.size(0))
-            if num_to_poison > 0:
-                poison_indices = torch.randperm(x.size(0))[:num_to_poison]
-                x_to_poison = x[poison_indices]
+            #
+            # ####################################################################
+            # ### 核心修改: 将污染逻辑改为只污染目标类别的样本             ###
+            # ####################################################################
+            #
+            # 1. 找到当前批次中所有属于目标类别的样本的索引
+            target_class_indices = (y == target_class).nonzero(as_tuple=True)[0]
 
-                with torch.no_grad():
-                    x_freq = freq_utils.to_freq(x_to_poison)
-                    freq_patch = freq_utils.extract_freq_patch_and_reshape(x_freq, **trigger_net_config)
-                    delta_patch = generator(freq_patch)
-                    poisoned_freq = freq_utils.reshape_and_insert_freq_patch(x_freq, delta_patch,
-                                                                             strength=injection_strength,
-                                                                             **trigger_net_config)
-                    x_p = freq_utils.to_spatial(poisoned_freq)
-                    x_p = torch.clamp(x_p, 0, 1)
+            # 2. 只有当批次中存在目标类别样本时，才进行污染
+            if target_class_indices.numel() > 0:
+                # 3. 根据poison_rate，计算需要污染的目标类别样本数量
+                num_to_poison = int(poison_rate * target_class_indices.numel())
 
-                x[poison_indices] = x_p
-                if config['victim_training']['attack_type'] == 'all_to_one':
-                    y[poison_indices] = target_class
+                if num_to_poison > 0:
+                    # 4. 从目标类别样本中，随机选择一部分进行污染
+                    perm = torch.randperm(target_class_indices.numel())
+                    poison_indices = target_class_indices[perm[:num_to_poison]]
+
+                    x_to_poison = x[poison_indices]
+
+                    with torch.no_grad():
+                        x_freq = freq_utils.to_freq(x_to_poison)
+                        freq_patch = freq_utils.extract_freq_patch_and_reshape(x_freq, **trigger_net_config)
+                        delta_patch = generator(freq_patch)
+                        poisoned_freq = freq_utils.reshape_and_insert_freq_patch(x_freq, delta_patch,
+                                                                                 strength=injection_strength,
+                                                                                 **trigger_net_config)
+                        x_p = freq_utils.to_spatial(poisoned_freq)
+                        x_p = torch.clamp(x_p, 0, 1)
+
+                    # 5. 将污染后的样本放回原位
+                    x[poison_indices] = x_p
+            # ####################################################################
 
             optimizer.zero_grad()
             outputs = victim_model(x)

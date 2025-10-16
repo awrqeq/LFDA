@@ -1,0 +1,79 @@
+# General Configuration
+device_ids: [0]
+seed: 42
+num_workers: 4
+
+# Data Configuration
+dataset:
+  name: "cifar10"
+  path: "./datasets/cifar10"
+  img_size: 32
+  num_classes: 10
+
+# Model Configuration
+model:
+  name: "resnet18"
+
+# --- STAGE 1: JOINT TRAINING (to create the generator) ---
+joint_training:
+  epochs: 100
+  batch_size: 1024
+  target_class: 0
+
+  poison_ratio_in_batch: 0.5
+
+  # Optimizers
+  optimizer_F:
+    type: "SGD"
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 0.0005
+  optimizer_G:
+    type: "Adam"
+    lr: 0.001
+
+  # Loss weights
+  lambda_attack: 1.0
+  lambda_stealth_lpips: 5.0
+  lambda_feat: 0.5
+
+  # Upgraded training strategy parameters
+  weak_trigger_strength: 0.3
+  strong_trigger_strength: 0.8
+
+  # Trigger parameters (shared across stages)
+  trigger_net:
+    patch_size: 16
+    start_row: 8
+    start_col: 8
+  injection_strength: 0.5 # Note: This is now overridden by weak/strong strength
+
+  eval_every_epochs: 10
+  save_dir: "./checkpoints/stage1_joint_training"
+  generator_save_name: "generator_final.pth"
+  classifier_save_name: "classifier_companion.pth"
+
+# --- STAGE 2: VICTIM TRAINING (for data poisoning simulation) ---
+victim_training:
+  epochs: 100
+  batch_size: 1024
+  poison_rate: 0.05 # The actual data poisoning rate on the victim's dataset
+
+  # Path to the generator created in Stage 1
+  generator_path: "./checkpoints/advanced_joint/generator_final_adv.pth"
+
+  optimizer_F:
+    type: "SGD"
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 0.0005
+
+  eval_every_epochs: 10
+  save_dir: "./checkpoints/stage2_victim_training"
+  victim_save_name: "victim_model_final.pth"
+
+# --- FINAL EVALUATION CONFIG ---
+evaluation:
+  victim_model_path: "./checkpoints/stage2_victim_training/victim_model_final.pth"
+  generator_path: "./checkpoints/advanced_joint/generator_final_adv.pth"
+  batch_size: 1024

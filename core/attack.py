@@ -1,70 +1,87 @@
 import torch
 import torch.nn as nn
 from core.utils import freq_utils
-from core.losses import AssociativeLoss, LatentLoss, StealthLoss, SmoothnessLoss
+from core.losses import AttackLoss, FeatureLoss, StealthLoss, FeatureMatchingLoss
+from pytorch_wavelets import DWTForward, DWTInverse
 
 
-class LFDA_U_Attack:
-    def __init__(self, generator: nn.Module, surrogate_model: nn.Module,
-                 loss_weights: dict, device: torch.device,
-                 trigger_net_config: dict, injection_strength: float):
+class BackdoorAttack:
+    def __init__(self, generator: nn.Module, classifier: nn.Module,
+                 config: dict, device: torch.device):
         self.generator = generator
-        self.surrogate_model = surrogate_model
-        self.loss_weights = loss_weights
+        self.classifier = classifier
+        self.config = config['joint_training']  # 直接使用联合训练的配置
         self.device = device
 
-        # NFF specific configs
-        self.patch_size = trigger_net_config['patch_size']
-        self.start_row = trigger_net_config['start_row']
-        self.start_col = trigger_net_config['start_col']
-        self.injection_strength = injection_strength
+        self.target_class = self.config['target_class']
 
-        self.associative_loss = AssociativeLoss().to(device)
-        self.latent_loss = LatentLoss().to(device)
+        # 获取DWT/IDWT变换器
+        self.dwt, self.idwt = freq_utils.get_dwt_idwt(device)
+
+        # 初始化损失函数
+        self.attack_loss_fn = AttackLoss().to(device)
+        self.feature_loss_fn = FeatureLoss().to(device)
         self.stealth_loss_fn = StealthLoss(device=device)
-        self.smoothness_loss = SmoothnessLoss().to(device)
+        # 注意：特征匹配损失现在不再需要，因为我们用联合训练代替了
+        # self.feat_match_loss_fn = FeatureMatchingLoss().to(device)
 
-    def forward_pass(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x_freq = freq_utils.to_freq(x)
-
-        freq_patch_reshaped = freq_utils.extract_freq_patch_and_reshape(
-            x_freq, self.patch_size, self.start_row, self.start_col
-        )
-
-        delta_patch_reshaped = self.generator(freq_patch_reshaped)
-
-        poisoned_freq = freq_utils.reshape_and_insert_freq_patch(
-            x_freq, delta_patch_reshaped, self.patch_size, self.start_row, self.start_col, self.injection_strength
-        )
-
-        x_p = freq_utils.to_spatial(poisoned_freq)
-        x_p = torch.clamp(x_p, 0, 1)
-
-        return x_p, delta_patch_reshaped
-
-    def calculate_loss(self, x: torch.Tensor, y: torch.Tensor, x_p: torch.Tensor, delta_patch_reshaped: torch.Tensor,
-                       target_class: int) -> torch.Tensor:
-        outputs_p = self.surrogate_model(x_p)
-
-        # --- MODIFICATION FOR DataParallel COMPATIBILITY ---
-        # Access the original model's methods via .module if it's wrapped
-        if isinstance(self.surrogate_model, nn.DataParallel):
-            h_x = self.surrogate_model.module.get_features(x).detach()
-            h_p = self.surrogate_model.module.get_features(x_p)
+    def generate_poisoned_sample(self, x: torch.Tensor, is_train: bool) -> torch.Tensor:
+        """
+        实现全新的“动态多谱自适应攻击”流程。
+        is_train: 标志位，判断是训练阶段（弱触发）还是评估阶段（强触发）
+        """
+        # 1. 自适应强度计算
+        if is_train:
+            # 训练时使用动态强度
+            dynamic_strength = freq_utils.get_image_complexity(x)
+            base_strength = self.config.get('weak_trigger_strength', 0.3)
+            strength = base_strength * dynamic_strength
         else:
-            h_x = self.surrogate_model.get_features(x).detach()
-            h_p = self.surrogate_model.get_features(x_p)
-        # --- END MODIFICATION ---
+            # 评估时使用固定的强触发
+            strength = self.config.get('strong_trigger_strength', 0.8)
 
-        loss_assoc = self.associative_loss(outputs_p, y, target_class)
-        loss_latent = self.latent_loss(h_p, h_x)
-        loss_stealth_mse, loss_stealth_lpips = self.stealth_loss_fn(x_p, x)
-        loss_smooth = self.smoothness_loss(delta_patch_reshaped)
+        # 2. 多谱变换与注入
+        ll, (lh, hl, hh) = freq_utils.to_dwt(x, self.dwt)
 
-        total_loss = (loss_assoc * self.loss_weights.get('lambda_assoc', 1.0) +  # Added conditional assoc loss weight
-                      self.loss_weights['lambda_latent'] * loss_latent +
-                      self.loss_weights['lambda_stealth_mse'] * loss_stealth_mse +
-                      self.loss_weights['lambda_stealth_lpips'] * loss_stealth_lpips +
-                      self.loss_weights['lambda_smooth'] * loss_smooth)
+        # a. 生成触发器
+        delta_hh = self.generator(hh)
+
+        # b. 注入
+        hh_poisoned = hh + strength * delta_hh
+
+        # c. 重构
+        x_preliminary = freq_utils.to_idwt(ll, [lh, hl, hh_poisoned], self.idwt)
+
+        # 3. 全局平滑
+        x_poisoned = freq_utils.double_dct_smooth(x_preliminary, x, alpha=0.5)
+        x_poisoned = torch.clamp(x_poisoned, 0, 1)
+
+        return x_poisoned
+
+    def calculate_joint_backdoor_loss(self, x_source: torch.Tensor, x_poisoned: torch.Tensor) -> torch.Tensor:
+        """
+        计算用于联合训练的后门路径总损失。
+        """
+        # --- 获取分类器 F_w 的前向传播结果 ---
+        outputs_poisoned = self.classifier(x_poisoned)
+
+        if isinstance(self.classifier, nn.DataParallel):
+            get_features = self.classifier.module.get_features
+        else:
+            get_features = self.classifier.get_features
+
+        features_poisoned = get_features(x_poisoned)
+        with torch.no_grad():
+            features_source = get_features(x_source)
+
+        # --- 计算各项损失 ---
+        loss_attack = self.attack_loss_fn(outputs_poisoned, self.target_class)
+        loss_feat_preserve = self.feature_loss_fn(features_poisoned, features_source)
+        _, loss_stealth_lpips = self.stealth_loss_fn(x_poisoned, x_source)
+
+        # --- 加权求和 ---
+        total_loss = (self.config['lambda_attack'] * loss_attack +
+                      self.config['lambda_feat'] * loss_feat_preserve +
+                      self.config['lambda_stealth_lpips'] * loss_stealth_lpips)
 
         return total_loss

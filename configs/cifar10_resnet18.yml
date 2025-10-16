@@ -1,5 +1,5 @@
 # General Configuration
-device_ids: [0, 1] # Start with a single GPU for simplicity, can be changed to [0, 1]
+device_ids: [0]
 seed: 42
 num_workers: 4
 
@@ -11,57 +11,44 @@ dataset:
   num_classes: 10
 
 # Model Configuration
-surrogate_model:
-  name: "resnet18"
-  pretrained_path: "./pretrained/resnet18_cifar10.pth"
-victim_model:
+model:
   name: "resnet18"
 
-# NFF Trigger Generator Training Configuration
-generator_training:
+# --- 联合端到端训练配置 (高级版) ---
+joint_training:
   epochs: 100
-  batch_size: 2048
-  lr: 0.001
-
-  # NFF Specific Parameters
-  trigger_net:
-    # The frequency patch to be used as input for the trigger network
-    # For a 32x32 image, this extracts a 16x16 mid-frequency patch
-    patch_size: 16
-    start_row: 8
-    start_col: 8
-
-  injection_strength: 0.5 # Controls the magnitude of the generated perturbation
-
-  # Loss weights (Balanced & Effective for NFF)
-  lambda_latent: 0.0001
-  lambda_stealth_mse: 15.0
-  lambda_stealth_lpips: 7.0
-  lambda_smooth: 0.001
-
-  save_dir: "./checkpoints/generator"
-  save_name: "nff_trigger_net.pth"
-
-# Victim Model Training Configuration
-victim_training:
-  generator_path: "./checkpoints/generator/nff_trigger_net.pth"
-  epochs: 200
-  batch_size: 2048
-  lr: 0.1
-  momentum: 0.9
-  weight_decay: 0.0005
-
-  attack_type: "all_to_one" # Use the effective all_to_one poisoning strategy
-  poison_rate: 08 # 10% poisoning rate
+  batch_size: 1024
   target_class: 0
 
-  eval_every_epochs: 5
+  poison_ratio_in_batch: 0.5
 
-  save_dir: "./checkpoints/victim_model"
-  save_name: "victim_resnet18_nff.pth"
+  # Optimizers
+  optimizer_F:
+    type: "SGD"
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 0.0005
+  optimizer_G:
+    type: "Adam"
+    lr: 0.001
 
-# Evaluation Configuration
+  # Loss weights
+  lambda_attack: 2.0
+  lambda_stealth_lpips: 5.0
+  lambda_feat: 0.5
+
+  # 升级的训练策略参数
+  weak_trigger_strength: 0.3  # 训练时使用的基础强度
+  strong_trigger_strength: 0.8 # 评估时使用的基础强度
+
+  # Save & Eval Configuration
+  eval_every_epochs: 10
+  save_dir: "./checkpoints/advanced_joint"
+  generator_save_name: "generator_final_adv.pth"
+  classifier_save_name: "classifier_final_adv.pth"
+
+# --- 最终评估配置 ---
 evaluation:
-  victim_model_path: "./checkpoints/victim_model/victim_resnet18_nff.pth"
-  generator_path: "./checkpoints/generator/nff_trigger_net.pth"
-  batch_size: 512
+  victim_model_path: "./checkpoints/advanced_joint/classifier_final_adv.pth"
+  generator_path: "./checkpoints/advanced_joint/generator_final_adv.pth"
+  batch_size: 1024
