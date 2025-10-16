@@ -1,7 +1,5 @@
 # General Configuration
-# REMOVED: device: "cuda"
-# ADDED: device_ids list to control GPU usage
-device_ids: [0, 1]  # Use GPUs 0 and 1. For single GPU, use [0] or [1].
+device_ids: [0, 1] # Start with a single GPU for simplicity, can be changed to [0, 1]
 seed: 42
 num_workers: 4
 
@@ -19,41 +17,51 @@ surrogate_model:
 victim_model:
   name: "resnet18"
 
-# LFDA-U Trigger Generator Training Configuration (using the high-ASR config)
+# NFF Trigger Generator Training Configuration
 generator_training:
   epochs: 100
-  batch_size: 128
+  batch_size: 2048
   lr: 0.001
-  target_class: 0
 
-  lambda_latent: 1.0
-  lambda_stealth_mse: 10.0
-  lambda_stealth_lpips: 5.0
+  # NFF Specific Parameters
+  trigger_net:
+    # The frequency patch to be used as input for the trigger network
+    # For a 32x32 image, this extracts a 16x16 mid-frequency patch
+    patch_size: 16
+    start_row: 8
+    start_col: 8
+
+  injection_strength: 0.5 # Controls the magnitude of the generated perturbation
+
+  # Loss weights (Balanced & Effective for NFF)
+  lambda_latent: 0.0001
+  lambda_stealth_mse: 15.0
+  lambda_stealth_lpips: 7.0
   lambda_smooth: 0.001
 
   save_dir: "./checkpoints/generator"
-  save_name: "generator_cifar10_v4.pth"
+  save_name: "nff_trigger_net.pth"
 
 # Victim Model Training Configuration
 victim_training:
-  generator_path: "./checkpoints/generator/generator_cifar10_v4.pth"
-  epochs: 100
-  batch_size: 128
+  generator_path: "./checkpoints/generator/nff_trigger_net.pth"
+  epochs: 200
+  batch_size: 2048
   lr: 0.1
   momentum: 0.9
   weight_decay: 0.0005
 
-  attack_type: "clean_label"
-  poison_rate: 0.1
+  attack_type: "all_to_one" # Use the effective all_to_one poisoning strategy
+  poison_rate: 08 # 10% poisoning rate
   target_class: 0
 
   eval_every_epochs: 5
 
   save_dir: "./checkpoints/victim_model"
-  save_name: "victim_resnet18_cifar10.pth"
+  save_name: "victim_resnet18_nff.pth"
 
 # Evaluation Configuration
 evaluation:
-  victim_model_path: "./checkpoints/victim_model/victim_resnet18_cifar10.pth"
-  generator_path: "./checkpoints/generator/generator_cifar10_v4.pth"
-  batch_size: 256
+  victim_model_path: "./checkpoints/victim_model/victim_resnet18_nff.pth"
+  generator_path: "./checkpoints/generator/nff_trigger_net.pth"
+  batch_size: 512

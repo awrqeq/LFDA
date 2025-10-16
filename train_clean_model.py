@@ -1,3 +1,6 @@
+#
+# 请用以下全部代码覆盖您的 train_clean_model.py 文件
+#
 import yaml
 import torch
 import torch.nn as nn
@@ -5,31 +8,53 @@ import torch.optim as optim
 from tqdm import tqdm
 import os
 
+# --- 环境设置 ---
+project_dir = os.path.dirname(os.path.abspath(__file__))
+torch_hub_dir = os.path.join(project_dir, 'pretrained', 'torch_hub')
+os.makedirs(torch_hub_dir, exist_ok=True)
+torch.hub.set_dir(torch_hub_dir)
+# --- 环境设置结束 ---
+
 from core.models.resnet import ResNet18
 from data.cifar10 import get_dataloader
 
 
 def main(config_path):
-    # Load config, but we only need a few parameters from it
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    device = torch.device(config['device'])
+    # --- 设备设置 ---
+    if torch.cuda.is_available() and config.get('device_ids'):
+        device_ids = config['device_ids']
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, device_ids))
+        if len(device_ids) > 0:
+            device = torch.device("cuda:0")
+            print(f"Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
+        else:
+            device_ids = []
+            device = torch.device("cpu")
+            print("No GPUs specified, using CPU.")
+    else:
+        device_ids = []
+        device = torch.device("cpu")
+        print("CUDA not available or no GPUs specified, using CPU.")
+    # --- 设备设置结束 ---
+
     torch.manual_seed(config['seed'])
 
-    # --- Use victim_training parameters for clean model training for consistency ---
     train_config = config['victim_training']
 
-    # Load data
     train_loader = get_dataloader(train_config['batch_size'], True, config['dataset']['path'], config['num_workers'])
     test_loader = get_dataloader(config['evaluation']['batch_size'], False, config['dataset']['path'],
                                  config['num_workers'])
 
-    # Initialize a clean model
+    # --- 模型初始化 ---
     model = ResNet18(num_classes=config['dataset']['num_classes']).to(device)
+    if len(device_ids) > 1:
+        model = nn.DataParallel(model)
 
-    # Setup optimizer and loss
-    optimizer = optim.SGD(model.parameters(), lr=train_config['lr'], momentum=train_config['momentum'],
+    params_to_optimize = model.module.parameters() if isinstance(model, nn.DataParallel) else model.parameters()
+    optimizer = optim.SGD(params_to_optimize, lr=train_config['lr'], momentum=train_config['momentum'],
                           weight_decay=train_config['weight_decay'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_config['epochs'])
     criterion = nn.CrossEntropyLoss()
@@ -38,7 +63,9 @@ def main(config_path):
     best_acc = 0.0
 
     for epoch in range(train_config['epochs']):
-        model.train()
+        model_to_train = model.module if isinstance(model, nn.DataParallel) else model
+        model_to_train.train()
+
         running_loss = 0.0
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{train_config['epochs']}")
         for x, y in progress_bar:
@@ -47,6 +74,10 @@ def main(config_path):
             optimizer.zero_grad()
             outputs = model(x)
             loss = criterion(outputs, y)
+
+            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                loss = loss.mean()
+
             loss.backward()
             optimizer.step()
 
@@ -55,7 +86,6 @@ def main(config_path):
 
         scheduler.step()
 
-        # Evaluate on test set
         model.eval()
         correct = 0
         total = 0
@@ -70,13 +100,15 @@ def main(config_path):
         acc = 100 * correct / total
         print(f"\nEpoch {epoch + 1} Test Accuracy: {acc:.2f}%")
 
-        # Save the best model
         if acc > best_acc:
             best_acc = acc
             save_dir = './pretrained'
             os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, 'resnet18_cifar10.pth')
-            torch.save(model.state_dict(), save_path)
+
+            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+            torch.save(model_to_save.state_dict(), save_path)
+
             print(f"Best model saved to {save_path} with accuracy {best_acc:.2f}%")
 
     print(f"--- Finished Clean Surrogate Model Training ---")

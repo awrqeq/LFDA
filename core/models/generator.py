@@ -2,65 +2,35 @@ import torch
 import torch.nn as nn
 
 
-class UNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=3):
-        super(UNet, self).__init__()
+class TriggerNet(nn.Module):
+    """
+    A small CNN that acts as the trigger.
+    It takes a frequency patch as input and outputs a perturbation patch.
+    This architecture is designed to be lightweight and effective.
+    """
 
-        def conv_block(in_c, out_c):
-            return nn.Sequential(
-                nn.Conv2d(in_c, out_c, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_c),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_c, out_c, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_c),
-                nn.ReLU(inplace=True)
-            )
+    def __init__(self, in_channels=2, out_channels=2):
+        super(TriggerNet, self).__init__()
 
-        def up_conv(in_c, out_c):
-            return nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2)
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, out_channels, kernel_size=3, padding=1)
+        )
 
-        self.enc1 = conv_block(in_channels, 64)
-        self.enc2 = conv_block(64, 128)
-        self.enc3 = conv_block(128, 256)
-
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        self.bottleneck = conv_block(256, 512)
-
-        self.up3 = up_conv(512, 256)
-        self.dec3 = conv_block(512, 256)
-        self.up2 = up_conv(256, 128)
-        self.dec2 = conv_block(256, 128)
-        self.up1 = up_conv(128, 64)
-        self.dec1 = conv_block(128, 64)
-
-        self.out_conv = nn.Conv2d(64, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # Encoder
-        e1 = self.enc1(x)
-        p1 = self.pool(e1)
-        e2 = self.enc2(p1)
-        p2 = self.pool(e2)
-        e3 = self.enc3(p2)
-        p3 = self.pool(e3)
-
-        # Bottleneck
-        b = self.bottleneck(p3)
-
-        # Decoder
-        u3 = self.up3(b)
-        c3 = torch.cat([u3, e3], dim=1)
-        d3 = self.dec3(c3)
-
-        u2 = self.up2(d3)
-        c2 = torch.cat([u2, e2], dim=1)
-        d2 = self.dec2(c2)
-
-        u1 = self.up1(d2)
-        c1 = torch.cat([u1, e1], dim=1)
-        d1 = self.dec1(c1)
-
-        out = self.out_conv(d1)
-        # We use tanh to constrain the output range of phase offset to [-pi, pi]
-        return torch.pi * torch.tanh(out)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Processes the input frequency patch to generate a perturbation patch.
+        Args:
+            x (torch.Tensor): The input frequency patch, with shape (B, 2, H, W)
+                              where 2 channels are real and imaginary parts.
+        Returns:
+            torch.Tensor: The output perturbation patch of the same shape.
+        """
+        perturbation = self.layers(x)
+        # Use tanh to bound the output to [-1, 1], which will be scaled by injection_strength later
+        return torch.tanh(perturbation)

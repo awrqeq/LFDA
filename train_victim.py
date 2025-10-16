@@ -13,12 +13,13 @@ torch.hub.set_dir(torch_hub_dir)
 # --- END ADDITION ---
 
 from core.models.resnet import ResNet18
-from core.models.generator import UNet
+from core.models.generator import TriggerNet
 from data.cifar10 import get_dataloader
+from core.utils import freq_utils
 
 
 # --- MODIFIED: evaluate function updated for multi-GPU ---
-def evaluate(victim_model, generator, test_loader, device, target_class):
+def evaluate(victim_model, generator, test_loader, device, target_class, trigger_net_config, injection_strength):
     victim_model.eval()
     generator.eval()
 
@@ -26,6 +27,10 @@ def evaluate(victim_model, generator, test_loader, device, target_class):
     total_correct_poisoned = 0
     total_poisoned_samples = 0
     total_samples = 0
+
+    patch_size = trigger_net_config['patch_size']
+    start_row = trigger_net_config['start_row']
+    start_col = trigger_net_config['start_col']
 
     with torch.no_grad():
         for x, y in tqdm(test_loader, desc="Evaluating BA", leave=False):
@@ -35,7 +40,7 @@ def evaluate(victim_model, generator, test_loader, device, target_class):
             total_samples += y.size(0)
             total_correct_clean += (predicted == y).sum().item()
 
-        ba = 100 * total_correct_clean / total_samples
+        ba = 100 * total_correct_clean / total_samples if total_samples > 0 else 0
 
         for x, y in tqdm(test_loader, desc="Evaluating ASR", leave=False):
             x, y = x.to(device), y.to(device)
@@ -45,12 +50,12 @@ def evaluate(victim_model, generator, test_loader, device, target_class):
 
             x_to_poison = x[non_target_mask]
 
-            delta_phi = generator(x_to_poison)
-            x_freq = torch.fft.fft2(x_to_poison, dim=(-2, -1))
-            amp, phase = x_freq.abs(), x_freq.angle()
-            poisoned_phase = phase + delta_phi
-            poisoned_freq = torch.polar(amp, poisoned_phase)
-            x_p = torch.fft.ifft2(poisoned_freq, dim=(-2, -1)).real
+            x_freq = freq_utils.to_freq(x_to_poison)
+            freq_patch = freq_utils.extract_freq_patch_and_reshape(x_freq, patch_size, start_row, start_col)
+            delta_patch = generator(freq_patch)
+            poisoned_freq = freq_utils.reshape_and_insert_freq_patch(x_freq, delta_patch, patch_size, start_row,
+                                                                     start_col, injection_strength)
+            x_p = freq_utils.to_spatial(poisoned_freq)
             x_p = torch.clamp(x_p, 0, 1)
 
             outputs = victim_model(x_p)
@@ -59,7 +64,7 @@ def evaluate(victim_model, generator, test_loader, device, target_class):
             total_poisoned_samples += x_to_poison.size(0)
             total_correct_poisoned += (predicted == target_class).sum().item()
 
-    asr = 100 * total_correct_poisoned / total_poisoned_samples
+    asr = 100 * total_correct_poisoned / total_poisoned_samples if total_poisoned_samples > 0 else 0
 
     return ba, asr
 
@@ -78,11 +83,13 @@ def main(config_path):
             device = torch.device("cuda:0")
             print(f"Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
         else:
+            device_ids = []
             device = torch.device("cpu")
             print("No GPUs specified, using CPU.")
     else:
+        device_ids = []
         device = torch.device("cpu")
-        print("CUDA not available, using CPU.")
+        print("CUDA not available or no GPUs specified, using CPU.")
     # --- END ADDITION ---
 
     torch.manual_seed(config['seed'])
@@ -94,7 +101,7 @@ def main(config_path):
 
     # --- MODIFIED: Model initialization for multi-GPU ---
     victim_model = ResNet18(num_classes=config['dataset']['num_classes']).to(device)
-    generator = UNet().to(device)
+    generator = TriggerNet().to(device)
     generator.load_state_dict(torch.load(config['victim_training']['generator_path'], map_location=device))
 
     if len(device_ids) > 1:
@@ -103,21 +110,24 @@ def main(config_path):
     # --- END MODIFICATION ---
 
     generator.eval()
+    for param in generator.parameters():
+        param.requires_grad = False
 
-    # --- MODIFIED: Ensure optimizer gets params from the original model if wrapped ---
     params_to_optimize = victim_model.module.parameters() if isinstance(victim_model,
                                                                         nn.DataParallel) else victim_model.parameters()
     optimizer = optim.SGD(params_to_optimize, lr=config['victim_training']['lr'],
                           momentum=config['victim_training']['momentum'],
                           weight_decay=config['victim_training']['weight_decay'])
-    # --- END MODIFICATION ---
-
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['victim_training']['epochs'])
     criterion = nn.CrossEntropyLoss()
 
-    print("Starting victim model training...")
+    trigger_net_config = config['generator_training']['trigger_net']
+    injection_strength = config['generator_training']['injection_strength']
+    target_class = config['victim_training']['target_class']
+    poison_rate = config['victim_training']['poison_rate']
+
+    print("--- Starting Victim Model Training (NFF) ---")
     for epoch in range(config['victim_training']['epochs']):
-        # Use .module to access original model's train() method if wrapped
         model_to_train = victim_model.module if isinstance(victim_model, nn.DataParallel) else victim_model
         model_to_train.train()
 
@@ -125,34 +135,31 @@ def main(config_path):
         for x, y in progress_bar:
             x, y = x.to(device), y.to(device)
 
-            num_to_poison = int(config['victim_training']['poison_rate'] * x.size(0))
-            if num_to_poison == 0:
-                continue
-            poison_indices = torch.randperm(x.size(0))[:num_to_poison]
+            num_to_poison = int(poison_rate * x.size(0))
+            if num_to_poison > 0:
+                poison_indices = torch.randperm(x.size(0))[:num_to_poison]
+                x_to_poison = x[poison_indices]
 
-            x_to_poison = x[poison_indices]
+                with torch.no_grad():
+                    x_freq = freq_utils.to_freq(x_to_poison)
+                    freq_patch = freq_utils.extract_freq_patch_and_reshape(x_freq, **trigger_net_config)
+                    delta_patch = generator(freq_patch)
+                    poisoned_freq = freq_utils.reshape_and_insert_freq_patch(x_freq, delta_patch,
+                                                                             strength=injection_strength,
+                                                                             **trigger_net_config)
+                    x_p = freq_utils.to_spatial(poisoned_freq)
+                    x_p = torch.clamp(x_p, 0, 1)
 
-            with torch.no_grad():
-                delta_phi = generator(x_to_poison)
-                x_freq = torch.fft.fft2(x_to_poison, dim=(-2, -1))
-                amp, phase = x_freq.abs(), x_freq.angle()
-                poisoned_phase = phase + delta_phi
-                poisoned_freq = torch.polar(amp, poisoned_phase)
-                x_p = torch.fft.ifft2(poisoned_freq, dim=(-2, -1)).real
-                x_p = torch.clamp(x_p, 0, 1)
-
-            x[poison_indices] = x_p
-            if config['victim_training']['attack_type'] == 'all_to_one':
-                y[poison_indices] = config['victim_training']['target_class']
+                x[poison_indices] = x_p
+                if config['victim_training']['attack_type'] == 'all_to_one':
+                    y[poison_indices] = target_class
 
             optimizer.zero_grad()
             outputs = victim_model(x)
             loss = criterion(outputs, y)
 
-            # --- MODIFICATION for DataParallel: average loss if multiple GPUs ---
             if isinstance(loss, torch.Tensor) and loss.dim() > 0:
                 loss = loss.mean()
-            # --- END MODIFICATION ---
 
             loss.backward()
             optimizer.step()
@@ -162,11 +169,13 @@ def main(config_path):
         scheduler.step()
 
         if (epoch + 1) % config['victim_training']['eval_every_epochs'] == 0:
-            ba, asr = evaluate(victim_model, generator, test_loader, device, config['victim_training']['target_class'])
+            ba, asr = evaluate(victim_model, generator, test_loader, device, target_class, trigger_net_config,
+                               injection_strength)
             print(f"\nEpoch {epoch + 1}: Benign Accuracy (BA) = {ba:.2f}%, Attack Success Rate (ASR) = {asr:.2f}%")
 
     print("\n--- Final Evaluation ---")
-    ba, asr = evaluate(victim_model, generator, test_loader, device, config['victim_training']['target_class'])
+    ba, asr = evaluate(victim_model, generator, test_loader, device, target_class, trigger_net_config,
+                       injection_strength)
     print(f"Final Benign Accuracy (BA): {ba:.2f}%")
     print(f"Final Attack Success Rate (ASR): {asr:.2f}%")
 
@@ -174,11 +183,8 @@ def main(config_path):
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, config['victim_training']['save_name'])
 
-    # --- MODIFIED: Save the state_dict from the original model ---
     model_to_save = victim_model.module if isinstance(victim_model, nn.DataParallel) else victim_model
     torch.save(model_to_save.state_dict(), save_path)
-    # --- END MODIFICATION ---
-
     print(f"Victim model saved to {save_path}")
 
 
