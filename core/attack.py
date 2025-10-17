@@ -1,87 +1,111 @@
+# =================================================================================================
+# core/attack.py
+# =================================================================================================
 import torch
-import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
+
 from core.utils import freq_utils
-from core.losses import AttackLoss, FeatureLoss, StealthLoss, FeatureMatchingLoss
-from pytorch_wavelets import DWTForward, DWTInverse
+from core.losses import FeatureLoss, PerceptualLoss
 
 
-class BackdoorAttack:
-    def __init__(self, generator: nn.Module, classifier: nn.Module,
-                 config: dict, device: torch.device):
+class AdversarialColearningAttack(object):
+
+    def __init__(self, cfg, generator, criterion_ce, device):
+        self.cfg = cfg
         self.generator = generator
-        self.classifier = classifier
-        self.config = config['joint_training']  # 直接使用联合训练的配置
         self.device = device
+        self.criterion_ce = criterion_ce
 
-        self.target_class = self.config['target_class']
+        # Attack parameters
+        self.target_class_idx = cfg.attack.target_class_idx
+        self.poisoning_ratio = cfg.attack.poisoning_ratio
+        self.magnitude = cfg.attack.magnitude
+        self.yf_thresh = cfg.attack.yf_thresh
 
-        # 获取DWT/IDWT变换器
-        self.dwt, self.idwt = freq_utils.get_dwt_idwt(device)
+        # Loss parameters for the generator
+        self.lambda_learnability = cfg.attack.lambda_learnability
+        self.lambda_transferability = cfg.attack.lambda_transferability
+        self.lambda_feat = cfg.attack.lambda_feat
+        self.lambda_stealth_lpips = cfg.attack.lambda_stealth_lpips
 
-        # 初始化损失函数
-        self.attack_loss_fn = AttackLoss().to(device)
-        self.feature_loss_fn = FeatureLoss().to(device)
-        self.stealth_loss_fn = StealthLoss(device=device)
-        # 注意：特征匹配损失现在不再需要，因为我们用联合训练代替了
-        # self.feat_match_loss_fn = FeatureMatchingLoss().to(device)
+        # Setup loss functions
+        self.feat_loss_fn = FeatureLoss()
+        self.stealth_loss_fn = PerceptualLoss().to(device)
 
-    def generate_poisoned_sample(self, x: torch.Tensor, is_train: bool) -> torch.Tensor:
-        """
-        实现全新的“动态多谱自适应攻击”流程。
-        is_train: 标志位，判断是训练阶段（弱触发）还是评估阶段（强触发）
-        """
-        # 1. 自适应强度计算
-        if is_train:
-            # 训练时使用动态强度
-            dynamic_strength = freq_utils.get_image_complexity(x)
-            base_strength = self.config.get('weak_trigger_strength', 0.3)
-            strength = base_strength * dynamic_strength
-        else:
-            # 评估时使用固定的强触发
-            strength = self.config.get('strong_trigger_strength', 0.8)
+        # Tensorboard for logging
+        self.writer = SummaryWriter(log_dir=cfg.log_dir)
+        self.global_step_g = 0  # Separate step counter for generator
 
-        # 2. 多谱变换与注入
-        ll, (lh, hl, hh) = freq_utils.to_dwt(x, self.dwt)
+    def generate_poisoned_sample(self, x_source, is_train=False):
+        self.generator.train() if is_train else self.generator.eval()
+        x_source = x_source.to(self.device)
 
-        # a. 生成触发器
-        delta_hh = self.generator(hh)
+        # Decompose, generate trigger, inject, and reconstruct
+        xf_source_list = freq_utils.dwt_decompose(x_source)
+        hh_component = xf_source_list[-1][:, :, :, :, -1]
+        delta_hh = self.generator(hh_component)
 
-        # b. 注入
-        hh_poisoned = hh + strength * delta_hh
+        dynamic_magnitude = freq_utils.get_dynamic_magnitude(
+            xf_source_list, self.yf_thresh, self.magnitude
+        ).to(self.device)
 
-        # c. 重构
-        x_preliminary = freq_utils.to_idwt(ll, [lh, hl, hh_poisoned], self.idwt)
-
-        # 3. 全局平滑
-        x_poisoned = freq_utils.double_dct_smooth(x_preliminary, x, alpha=0.5)
-        x_poisoned = torch.clamp(x_poisoned, 0, 1)
+        adv_xf_source_list = freq_utils.dwt_trigger_injection(
+            xf_source_list, delta_hh, dynamic_magnitude
+        )
+        x_poisoned = freq_utils.dwt_reconstruct(adv_xf_source_list)
+        x_poisoned = freq_utils.dct_based_smoothing(x_source, x_poisoned, self.device)
 
         return x_poisoned
 
-    def calculate_joint_backdoor_loss(self, x_source: torch.Tensor, x_poisoned: torch.Tensor) -> torch.Tensor:
+    def calculate_generator_loss(self, x_nontarget_source, x_poisoned_nontarget, victim_model, teacher_model):
         """
-        计算用于联合训练的后门路径总损失。
+        Calculates the composite loss for the generator based on the new strategy.
+        - victim_model: The model being trained from scratch (provides learnability signal).
+        - teacher_model: The pre-trained, frozen model (provides transferability signal).
         """
-        # --- 获取分类器 F_w 的前向传播结果 ---
-        outputs_poisoned = self.classifier(x_poisoned)
+        x_nontarget_source = x_nontarget_source.to(self.device)
+        x_poisoned_nontarget = x_poisoned_nontarget.to(self.device)
+        target_labels = torch.full((x_nontarget_source.size(0),), self.target_class_idx, dtype=torch.long,
+                                   device=self.device)
 
-        if isinstance(self.classifier, nn.DataParallel):
-            get_features = self.classifier.module.get_features
-        else:
-            get_features = self.classifier.get_features
+        # --- a) 后门可学习性损失 (loss_learnability) ---
+        # Evaluate on the current, learning victim_model
+        victim_model.eval()  # Temporarily set to eval mode for inference
+        outputs_victim = victim_model(x_poisoned_nontarget)
+        loss_learnability = self.criterion_ce(outputs_victim, target_labels)
+        victim_model.train()  # Set back to train mode
 
-        features_poisoned = get_features(x_poisoned)
+        # --- b) 对抗性迁移损失 (loss_transferability) ---
+        # Evaluate on the frozen, pre-trained teacher_model
+        # teacher_model is already in eval mode and requires no grad
         with torch.no_grad():
-            features_source = get_features(x_source)
+            outputs_teacher = teacher_model(x_poisoned_nontarget)
+        loss_transferability = self.criterion_ce(outputs_teacher, target_labels)
 
-        # --- 计算各项损失 ---
-        loss_attack = self.attack_loss_fn(outputs_poisoned, self.target_class)
-        loss_feat_preserve = self.feature_loss_fn(features_poisoned, features_source)
-        _, loss_stealth_lpips = self.stealth_loss_fn(x_poisoned, x_source)
+        # --- c) 隐蔽性损失 (loss_stealth) ---
+        loss_stealth_lpips = self.stealth_loss_fn(x_poisoned_nontarget, x_nontarget_source)
 
-        # --- 加权求和 ---
-        total_loss = (self.config['lambda_attack'] * loss_attack +
-                      self.config['lambda_feat'] * loss_feat_preserve +
-                      self.config['lambda_stealth_lpips'] * loss_stealth_lpips)
+        # Optional: Feature preservation loss (can be used to further regularize)
+        if self.lambda_feat > 0:
+            with torch.no_grad():
+                features_source_teacher = teacher_model(x_nontarget_source, get_features=True)
+            features_poisoned_teacher = teacher_model(x_poisoned_nontarget, get_features=True)
+            loss_feat_preserve = self.feat_loss_fn(features_poisoned_teacher, features_source_teacher)
+        else:
+            loss_feat_preserve = torch.tensor(0.0, device=self.device)
 
-        return total_loss
+        # Log losses
+        self.writer.add_scalar('Generator/Loss_Learnability', loss_learnability.item(), self.global_step_g)
+        self.writer.add_scalar('Generator/Loss_Transferability', loss_transferability.item(), self.global_step_g)
+        self.writer.add_scalar('Generator/Loss_Stealth_LPIPS', loss_stealth_lpips.item(), self.global_step_g)
+        if self.lambda_feat > 0:
+            self.writer.add_scalar('Generator/Loss_Feature_Preservation', loss_feat_preserve.item(), self.global_step_g)
+        self.global_step_g += 1
+
+        # Combine all losses
+        total_generator_loss = (self.lambda_learnability * loss_learnability +
+                                self.lambda_transferability * loss_transferability +
+                                self.lambda_stealth_lpips * loss_stealth_lpips +
+                                self.lambda_feat * loss_feat_preserve)
+
+        return total_generator_loss

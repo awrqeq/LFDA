@@ -1,124 +1,103 @@
-#
-# 请用以下全部代码覆盖您的 train_clean_model.py 文件
-#
-import yaml
+# =================================================================================================
+# train_clean_model.py (Import修复 & 最终版)
+# =================================================================================================
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+import yaml
+import argparse
 import os
 
-# --- 环境设置 ---
-project_dir = os.path.dirname(os.path.abspath(__file__))
-torch_hub_dir = os.path.join(project_dir, 'pretrained', 'torch_hub')
-os.makedirs(torch_hub_dir, exist_ok=True)
-torch.hub.set_dir(torch_hub_dir)
-# --- 环境设置结束 ---
-
-from core.models.resnet import ResNet18
+# [修复] 从 data.cifar10 导入正确的 get_dataloader 函数
 from data.cifar10 import get_dataloader
+from core.models.resnet import ResNet18
 
 
-def main(config_path):
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+def train_clean(cfg):
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    # --- 设备设置 ---
-    if torch.cuda.is_available() and config.get('device_ids'):
-        device_ids = config['device_ids']
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, device_ids))
-        if len(device_ids) > 0:
-            device = torch.device("cuda:0")
-            print(f"Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
-        else:
-            device_ids = []
-            device = torch.device("cpu")
-            print("No GPUs specified, using CPU.")
-    else:
-        device_ids = []
-        device = torch.device("cpu")
-        print("CUDA not available or no GPUs specified, using CPU.")
-    # --- 设备设置结束 ---
+    # Create directories for saving models
+    os.makedirs(cfg['train_clean']['save_dir'], exist_ok=True)
 
-    torch.manual_seed(config['seed'])
+    # Load CIFAR-10 dataset using the correct function
+    train_loader = get_dataloader(
+        batch_size=cfg['train_clean']['batch_size'],
+        train=True,
+        path=cfg['dataset']['root_dir'],
+        num_workers=cfg['dataset']['num_workers']
+    )
+    test_loader = get_dataloader(
+        batch_size=cfg['train_clean']['batch_size'],
+        train=False,
+        path=cfg['dataset']['root_dir'],
+        num_workers=cfg['dataset']['num_workers']
+    )
 
-    train_config = config['victim_training']
+    # Build model
+    model = ResNet18(num_classes=cfg['dataset']['num_classes']).to(device)
 
-    train_loader = get_dataloader(train_config['batch_size'], True, config['dataset']['path'], config['num_workers'])
-    test_loader = get_dataloader(config['evaluation']['batch_size'], False, config['dataset']['path'],
-                                 config['num_workers'])
-
-    # --- 模型初始化 ---
-    model = ResNet18(num_classes=config['dataset']['num_classes']).to(device)
-    if len(device_ids) > 1:
-        model = nn.DataParallel(model)
-
-    params_to_optimize = model.module.parameters() if isinstance(model, nn.DataParallel) else model.parameters()
-    optimizer = optim.SGD(params_to_optimize, lr=train_config['lr'], momentum=train_config['momentum'],
-                          weight_decay=train_config['weight_decay'])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_config['epochs'])
+    # Setup optimizer and loss function
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=cfg['train_clean']['optimizer']['lr'],
+        momentum=cfg['train_clean']['optimizer']['momentum'],
+        weight_decay=cfg['train_clean']['optimizer']['weight_decay']
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['train_clean']['epochs'])
     criterion = nn.CrossEntropyLoss()
 
-    print("--- Starting Clean Surrogate Model Training ---")
-    best_acc = 0.0
-
-    for epoch in range(train_config['epochs']):
-        model_to_train = model.module if isinstance(model, nn.DataParallel) else model
-        model_to_train.train()
-
+    print("--- Starting Clean Model Training ---")
+    for epoch in range(cfg['train_clean']['epochs']):
+        model.train()
         running_loss = 0.0
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{train_config['epochs']}")
-        for x, y in progress_bar:
-            x, y = x.to(device), y.to(device)
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg['train_clean']['epochs']}")
+
+        for x_batch, y_batch in progress_bar:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
 
             optimizer.zero_grad()
-            outputs = model(x)
-            loss = criterion(outputs, y)
-
-            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
-                loss = loss.mean()
-
+            outputs = model(x_batch)
+            loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item()
-            progress_bar.set_postfix({'Loss': f'{running_loss / (progress_bar.n + 1):.4f}'})
+            progress_bar.set_postfix({'Loss': f'{(running_loss / (progress_bar.n + 1)):.4f}'})
 
         scheduler.step()
 
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for x, y in test_loader:
-                x, y = x.to(device), y.to(device)
-                outputs = model(x)
-                _, predicted = torch.max(outputs.data, 1)
-                total += y.size(0)
-                correct += (predicted == y).sum().item()
+        # Evaluate on test set every few epochs
+        if (epoch + 1) % cfg['train_clean']['eval_every_epochs'] == 0 or (epoch + 1) == cfg['train_clean']['epochs']:
+            model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for x_test, y_test in test_loader:
+                    x_test, y_test = x_test.to(device), y_test.to(device)
+                    outputs = model(x_test)
+                    _, predicted = torch.max(outputs.data, 1)
+                    total += y_test.size(0)
+                    correct += (predicted == y_test).sum().item()
+            accuracy = 100 * correct / total
+            print(f"\nEpoch {epoch + 1}: Test Accuracy = {accuracy:.2f}%")
 
-        acc = 100 * correct / total
-        print(f"\nEpoch {epoch + 1} Test Accuracy: {acc:.2f}%")
-
-        if acc > best_acc:
-            best_acc = acc
-            save_dir = './pretrained'
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, 'resnet18_cifar10.pth')
-
-            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-            torch.save(model_to_save.state_dict(), save_path)
-
-            print(f"Best model saved to {save_path} with accuracy {best_acc:.2f}%")
-
-    print(f"--- Finished Clean Surrogate Model Training ---")
-    print(f"Final best model is saved at './pretrained/resnet18_cifar10.pth' with accuracy {best_acc:.2f}%")
+    # Save the final model
+    save_path = os.path.join(cfg['train_clean']['save_dir'], cfg['train_clean']['save_name'])
+    torch.save(model.state_dict(), save_path)
+    print(f"Final clean model saved to {save_path}")
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/cifar10_resnet18.yml', help='Path to the config file')
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Train a clean model on CIFAR-10")
+    parser.add_argument('--config', type=str, default='configs/cifar10_clean.yml',
+                        help='Path to the config file for clean training')
     args = parser.parse_args()
-    main(args.config)
+
+    with open(args.config, 'r') as f:
+        cfg = yaml.safe_load(f)
+
+    train_clean(cfg)

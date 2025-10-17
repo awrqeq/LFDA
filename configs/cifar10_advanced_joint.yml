@@ -1,79 +1,50 @@
-# General Configuration
-device_ids: [0]
-seed: 42
-num_workers: 4
+# =================================================================================================
+# configs/cifar10_advanced_joint.yml (GPU配置版)
+# =================================================================================================
+# General settings
+log_dir: 'logs/adversarial_colearning'
+model_dir: 'checkpoints/adversarial_colearning'
 
-# Data Configuration
+# Dataset settings
 dataset:
-  name: "cifar10"
-  path: "./datasets/cifar10"
-  img_size: 32
+  name: 'CIFAR10'
+  root_dir: '~/home/machao/pythonproject/lfda/datasets/cifar10'
   num_classes: 10
-
-# Model Configuration
-model:
-  name: "resnet18"
-
-# --- STAGE 1: JOINT TRAINING (to create the generator) ---
-joint_training:
-  epochs: 100
   batch_size: 1024
-  target_class: 0
+  num_workers: 4
 
-  poison_ratio_in_batch: 0.5
+# Model settings
+# victim_model and generator are created from scratch
+# teacher_model is loaded from a pre-trained path
+teacher_model_path: 'checkpoints/clean_model/classifier_epoch_100.pth' # 重要：请确保此路径有预训练好的干净模型
 
-  # Optimizers
-  optimizer_F:
-    type: "SGD"
-    lr: 0.1
-    momentum: 0.9
-    weight_decay: 0.0005
-  optimizer_G:
-    type: "Adam"
-    lr: 0.001
+# Optimizer settings
+optimizer:
+  lr_F: 0.001       # Learning rate for victim_model
+  lr_G: 0.001       # Learning rate for generator
+  beta1: 0.5
+  beta2: 0.999
 
-  # Loss weights
-  lambda_attack: 1.0
-  lambda_stealth_lpips: 5.0
-  lambda_feat: 0.5
+# Training settings
+train:
+  max_epochs: 100
+  # --- GPU配置选项 ---
+  # 在这里指定要使用的GPU ID。
+  # 单GPU示例: '0'
+  # 双GPU示例: '0,1'
+  gpu_ids: '0,1'
 
-  # Upgraded training strategy parameters
-  weak_trigger_strength: 0.3
-  strong_trigger_strength: 0.8
+# Attack settings
+attack:
+  target_class_idx: 0
+  poisoning_ratio: 1.0  # 用于 victim_model 训练时，目标类中毒的比例
+  magnitude: 40.0
+  yf_thresh: 30.0
 
-  # Trigger parameters (shared across stages)
-  trigger_net:
-    patch_size: 16
-    start_row: 8
-    start_col: 8
-  injection_strength: 0.5 # Note: This is now overridden by weak/strong strength
+  # --- 复合损失权重 ---
+  lambda_learnability: 1.5      # 后门可学习性损失权重 (victim_model)
+  lambda_transferability: 0.5   # 对抗性迁移损失权重 (teacher_model)
 
-  eval_every_epochs: 10
-  save_dir: "./checkpoints/stage1_joint_training"
-  generator_save_name: "generator_final.pth"
-  classifier_save_name: "classifier_companion.pth"
-
-# --- STAGE 2: VICTIM TRAINING (for data poisoning simulation) ---
-victim_training:
-  epochs: 100
-  batch_size: 1024
-  poison_rate: 0.05 # The actual data poisoning rate on the victim's dataset
-
-  # Path to the generator created in Stage 1
-  generator_path: "./checkpoints/advanced_joint/generator_final_adv.pth"
-
-  optimizer_F:
-    type: "SGD"
-    lr: 0.1
-    momentum: 0.9
-    weight_decay: 0.0005
-
-  eval_every_epochs: 10
-  save_dir: "./checkpoints/stage2_victim_training"
-  victim_save_name: "victim_model_final.pth"
-
-# --- FINAL EVALUATION CONFIG ---
-evaluation:
-  victim_model_path: "./checkpoints/stage2_victim_training/victim_model_final.pth"
-  generator_path: "./checkpoints/advanced_joint/generator_final_adv.pth"
-  batch_size: 1024
+  # 其他损失权重保持不变
+  lambda_feat: 0.5              # 特征保持损失（可选，可以设为0来简化）
+  lambda_stealth_lpips: 5.0     # 视觉隐蔽性损失权重

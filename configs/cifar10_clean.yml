@@ -1,0 +1,29 @@
+# =================================================================================================
+# configs/cifar10_clean.yml
+# =================================================================================================
+# 这个配置文件专门用于 train_clean_model.py 脚本
+
+# Dataset settings (可以和另一个配置文件保持一致)
+dataset:
+  name: 'CIFAR10'
+  root_dir: '/home/machao/pythonproject/lfda/datasets/cifar10'
+  num_classes: 10
+  num_workers: 4
+
+# --- 'train_clean' 配置项 ---
+# 这是 train_clean_model.py 脚本需要的主配置项
+train_clean:
+  epochs: 100
+  batch_size: 1024
+  eval_every_epochs: 10
+
+  # 优化器设置
+  optimizer:
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 0.0005
+
+  # 模型保存路径设置
+  # 注意：这里的路径和文件名必须与 cifar10_advanced_joint.yml 中的 teacher_model_path 匹配！
+  save_dir: 'checkpoints/clean_model'
+  save_name: 'classifier_epoch_100.pth'

@@ -1,94 +1,105 @@
-#
-# 请用以下全部代码覆盖您的 visualize_attack.py 文件
-#
-import yaml
+# =================================================================================================
+# visualize_attack.py (Import修复 & 最终版)
+# =================================================================================================
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+import yaml
+import argparse
 import os
+import matplotlib.pyplot as plt
 
-# --- 环境设置 ---
-project_dir = os.path.dirname(os.path.abspath(__file__))
-torch_hub_dir = os.path.join(project_dir, 'pretrained', 'torch_hub')
-os.makedirs(torch_hub_dir, exist_ok=True)
-torch.hub.set_dir(torch_hub_dir)
-# --- 环境设置结束 ---
-
+# [修复] 从 data.cifar10 导入正确的 get_dataloader 函数
 from data.cifar10 import get_dataloader
-from core.models.generator import TriggerNet
-from core.utils.image_utils import save_image_grid
-from core.utils import freq_utils
+from core.models.generator import MultiScaleAttentionGenerator
+from core.attack import AdversarialColearningAttack
+from core.utils import image_utils
 
 
-def main(config_path):
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+def visualize(cfg):
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    # --- 设备设置 ---
-    if torch.cuda.is_available() and config.get('device_ids'):
-        device_ids = config['device_ids']
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, device_ids))
-        if len(device_ids) > 0:
-            device = torch.device("cuda:0")
-            print(f"Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
-        else:
-            device_ids = []
-            device = torch.device("cpu")
-            print("No GPUs specified, using CPU.")
-    else:
-        device_ids = []
-        device = torch.device("cpu")
-        print("CUDA not available or no GPUs specified, using CPU.")
-    # --- 设备设置结束 ---
+    # Load CIFAR-10 test dataset using the correct function
+    test_loader = get_dataloader(
+        batch_size=cfg['visualize']['num_images'],
+        train=False,
+        path=cfg['dataset']['root_dir'],
+        num_workers=cfg['dataset']['num_workers']
+    )
 
-    test_loader = get_dataloader(batch_size=8, train=False, path=config['dataset']['path'])
-
-    # --- 模型加载 ---
-    generator = TriggerNet()
-    generator.load_state_dict(torch.load(config['evaluation']['generator_path'], map_location='cpu'))
-    generator = generator.to(device)
-
-    if len(device_ids) > 1:
-        generator = nn.DataParallel(generator)
-
+    # Load the generator
+    generator = MultiScaleAttentionGenerator(input_channels=3).to(device)
+    generator_path = cfg['visualize']['generator_path']
+    print(f"Loading generator from: {generator_path}")
+    generator.load_state_dict(torch.load(generator_path, map_location=device))
     generator.eval()
 
-    x, y = next(iter(test_loader))
-    x = x.to(device)
+    # Setup Attack Helper
+    criterion_ce = nn.CrossEntropyLoss()
+    attack_helper = AdversarialColearningAttack(cfg, generator, criterion_ce, device)
 
-    # --- 获取NFF参数 ---
-    trigger_net_config = config['generator_training']['trigger_net']
-    injection_strength = config['generator_training']['injection_strength']
+    # Get a batch of images for visualization
+    x_batch, _ = next(iter(test_loader))
+    x_batch = x_batch.to(device)
 
-    # --- 使用NFF逻辑生成毒化样本 ---
-    with torch.no_grad():
-        x_freq = freq_utils.to_freq(x)
-        freq_patch = freq_utils.extract_freq_patch_and_reshape(x_freq, **trigger_net_config)
-        delta_patch = generator(freq_patch)
-        poisoned_freq = freq_utils.reshape_and_insert_freq_patch(x_freq, delta_patch, strength=injection_strength,
-                                                                 **trigger_net_config)
-        x_p = freq_utils.to_spatial(poisoned_freq)
-        x_p = torch.clamp(x_p, 0, 1)
+    # Generate poisoned samples
+    x_poisoned = attack_helper.generate_poisoned_sample(x_batch, is_train=False)
 
-    residual = torch.abs(x - x_p)
-    residual_amplified = torch.clamp(residual * 20, 0, 1)  # Amplify more for better visibility
+    # Calculate the perturbation (trigger)
+    perturbation = x_poisoned - x_batch
 
-    images_to_save, labels = [], []
-    for i in range(x.size(0)):
-        images_to_save.extend([x[i], x_p[i], residual_amplified[i]])
-        labels.extend([f'Original #{i}', f'Poisoned #{i}', f'Residual x20 #{i}'])
+    # Convert tensors to displayable format
+    x_clean_vis = image_utils.unnormalize_batch(x_batch.cpu())
+    x_poisoned_vis = image_utils.unnormalize_batch(x_poisoned.cpu())
+    perturbation_vis = image_utils.normalize_batch(perturbation.cpu())
 
-    save_dir = './outputs'
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, 'nff_attack_visualization.png')
+    # Create visualization
+    num_images = cfg['visualize']['num_images']
+    fig, axs = plt.subplots(3, num_images, figsize=(num_images * 2, 6))
+    fig.suptitle("Attack Visualization", fontsize=16)
 
-    save_image_grid(images_to_save, labels, save_path, nrow=3)
-    print(f"NFF Visualization saved to {save_path}")
+    for i in range(num_images):
+        axs[0, i].imshow(x_clean_vis[i].permute(1, 2, 0))
+        axs[0, i].set_title(f"Clean #{i + 1}")
+        axs[0, i].axis('off')
+
+        axs[1, i].imshow(perturbation_vis[i].permute(1, 2, 0))
+        axs[1, i].set_title("Perturbation")
+        axs[1, i].axis('off')
+
+        axs[2, i].imshow(x_poisoned_vis[i].permute(1, 2, 0))
+        axs[2, i].set_title("Poisoned")
+        axs[2, i].axis('off')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # Save the figure
+    save_path = cfg['visualize']['save_path']
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    print(f"Visualization saved to {save_path}")
+    plt.show()
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/cifar10_resnet18.yml', help='Path to the config file')
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Visualize Backdoor Attack")
+    parser.add_argument('--config', type=str, default='configs/cifar10_advanced_joint.yml',
+                        help='Path to the config file')
+    parser.add_argument('--generator_path', type=str, required=True, help='Path to the trained generator checkpoint')
+    parser.add_argument('--num_images', type=int, default=8, help='Number of images to visualize')
+    parser.add_argument('--save_path', type=str, default='visualizations/attack_visualization.png',
+                        help='Path to save the output image')
     args = parser.parse_args()
-    main(args.config)
+
+    with open(args.config, 'r') as f:
+        cfg = yaml.safe_load(f)
+
+    cfg['visualize'] = {
+        'generator_path': args.generator_path,
+        'num_images': args.num_images,
+        'save_path': args.save_path
+    }
+
+    visualize(cfg)
